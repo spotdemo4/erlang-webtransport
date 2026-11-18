@@ -1,5 +1,16 @@
 # WebTransport for Erlang
 
+> **Fork note.** This fork of
+> [benoitc/erlang-webtransport](https://github.com/benoitc/erlang-webtransport)
+> adds manual receive flow control for WebTransport streams
+> ([benoitc/erlang-webtransport#38](https://github.com/benoitc/erlang-webtransport/issues/38)):
+> start a listener, `accept/4` or `connect` with `flow_control => manual` and
+> return credit with `webtransport:consume(Session, Stream, Bytes)` once the
+> application has processed the data, so a handler can pass stream data to
+> another process and return at once. See
+> [Manual receive credit](#manual-receive-credit). The change is on the
+> `manual-flow-control` branch, merged into `main`.
+
 An Erlang implementation of the [WebTransport](https://www.w3.org/TR/webtransport/) protocol over:
 
 - **HTTP/3** ([draft-ietf-webtrans-http3-17](https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3-17)) using native QUIC streams; draft-15 clients are accepted too, and so are draft-07 (Safari 26) and draft-02 (Chrome, Firefox) clients in the default `auto` mode
