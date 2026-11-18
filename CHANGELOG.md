@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- New `flow_control => manual` option for listeners, `accept/4` and
+  `connect`, with `webtransport:consume/3` and a `{consume, Stream, Bytes}`
+  handler action. Stream data is then credited to the peer as the
+  application consumes it, not when the handler callback returns: QUIC
+  stream credit on HTTP/3, `WT_MAX_STREAM_DATA` on HTTP/2, and
+  `WT_MAX_DATA` where WebTransport flow control applies
+  (draft-ietf-webtrans-http3-17 §5.4, draft-ietf-webtrans-http2-16 §4.4).
+  A handler can hand data to another process and return at once while the
+  peer stays one stream window ahead of what was consumed.
+
 ## 0.5.11 - 2026-11-15
 
 - Requires quic 3.1.0. Over HTTP/3, a stream opened while its

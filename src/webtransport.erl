@@ -44,6 +44,10 @@
 %% %% Close stream
 %% ok = webtransport:close_stream(Session, Stream).
 %%
+%% %% With `flow_control => manual', return receive credit once the
+%% %% application has processed what the handler was given
+%% ok = webtransport:consume(Session, Stream, byte_size(Data)).
+%%
 %% %% Close session
 %% ok = webtransport:close_session(Session).
 %% '''
@@ -73,6 +77,7 @@
 -export([send_datagram/2]).
 -export([close_stream/2]).
 -export([reset_stream/3, stop_sending/3]).
+-export([consume/3]).
 -export([drain_session/1]).
 -export([close_session/1, close_session/2, close_session/3]).
 -export([session_info/1]).
@@ -93,6 +98,10 @@
     authority := binary(),
     headers => [{binary(), binary()}]
 }.
+%% Who returns receive credit for stream data. `auto' (default): once the
+%% handler callback that got the data returns. `manual': only for the bytes
+%% the application passes to consume/3.
+-type flow_control() :: auto | manual.
 
 -type listener_opts() :: #{
     transport := h2 | h3,
@@ -105,6 +114,7 @@
     max_streams_bidi => non_neg_integer(),
     max_streams_uni => non_neg_integer(),
     max_send_buffer => non_neg_integer(),
+    flow_control => flow_control(),
     %% Bind address / family. `ip' binds the listener socket to a specific
     %% address (IPv4 4-tuple or IPv6 8-tuple); `family' forces `inet' or
     %% `inet6' when no `ip' is given (e.g. the IPv6 wildcard). `socket_opts'
@@ -137,6 +147,7 @@
 
 -type connect_opts() :: #{
     transport => h2 | h3,
+    flow_control => flow_control(),
     certfile => file:filename(),
     keyfile => file:filename(),
     cacertfile => file:filename(),
@@ -166,7 +177,7 @@
     compat_mode => latest | legacy_browser_compat | draft07
 }.
 
--export_type([session/0, stream/0, request/0]).
+-export_type([session/0, stream/0, request/0, flow_control/0]).
 -export_type([listener_name/0, listener_opts/0, connect_opts/0, sni_callback/0]).
 
 -include("webtransport.hrl").
@@ -311,6 +322,9 @@ h2_wt_settings(Opts) ->
 %%     quic_h3:send_response(Conn, StreamId, 200, []),
 %%     quic_h3:send_data(Conn, StreamId, <<"hello">>, true).
 %% '''
+%%
+%% `Opts' takes the session options of {@link start_listener/2}, such as
+%% `max_data' and `flow_control'.
 -spec accept(pid(), non_neg_integer(), [{binary(), binary()}], map()) ->
     {ok, session()} | {error, term()}.
 accept(Conn, StreamId, Headers0, Opts) ->
@@ -319,19 +333,24 @@ accept(Conn, StreamId, Headers0, Opts) ->
     HandlerOpts = maps:get(handler_opts, Opts, #{}),
     Headers = with_request_pseudo(Headers0, undefined, maps:get(path, Opts, undefined)),
     Method = proplists:get_value(<<":method">>, Headers, <<>>),
-    case {Handler, Method} of
-        {undefined, _} ->
+    case {Handler, Method, valid_flow_control(Opts)} of
+        {_, _, false} ->
+            {error, {invalid_option, flow_control}};
+        {undefined, _, _} ->
             {error, missing_handler};
-        {_, <<"CONNECT">>} ->
+        {_, <<"CONNECT">>, _} ->
             Router = case Transport of
                 h3 -> get_or_create_router(Conn);
                 h2 -> undefined
             end,
             accept_connect(Transport, Conn, StreamId, Headers,
                            Handler, HandlerOpts, Opts, Router);
-        {_, _} ->
+        {_, _, _} ->
             {error, not_connect_method}
     end.
+
+valid_flow_control(Opts) ->
+    lists:member(maps:get(flow_control, Opts, auto), [auto, manual]).
 
 %% h2 hands its request handler the method and path as arguments, not as
 %% `:method' and `:path' headers. Put them back so every path reads the
@@ -580,6 +599,7 @@ start_accepted(Transport, Conn, StreamId, Headers, Handler, HandlerOpts, Opts, R
         max_streams_bidi => maps:get(max_streams_bidi, Opts, ?DEFAULT_MAX_STREAMS_BIDI),
         max_streams_uni => maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI),
         max_send_buffer => maps:get(max_send_buffer, Opts, ?DEFAULT_MAX_SEND_BUFFER),
+        flow_control => maps:get(flow_control, Opts, auto),
         %% A listener pinned to legacy mode sends no flow-control SETTINGS.
         declared_flow_control =>
             maps:get(compat_mode, Opts, auto) =/= legacy_browser_compat,
@@ -735,6 +755,9 @@ ensure_router_table() ->
 %% - `max_data' - Optional. Initial max session data (default 1MB)
 %% - `max_streams_bidi' - Optional. Initial max bidi streams (default 100)
 %% - `max_streams_uni' - Optional. Initial max uni streams (default 100)
+%% - `flow_control' - Optional. `auto' (default) returns receive credit for
+%%   stream data once the handler callback that got it returns; `manual'
+%%   only for the bytes passed to {@link consume/3}
 %%
 -spec start_listener(listener_name(), listener_opts()) ->
     {ok, pid()} | {error, term()}.
@@ -829,6 +852,8 @@ listener_sockname(Name) ->
 %% - `verify' - Optional. `verify_none' or `verify_peer' (default: verify_peer)
 %% - `headers' - Optional. Extra headers to send in CONNECT request
 %% - `timeout' - Optional. Connection timeout in ms (default: 30000)
+%% - `flow_control' - Optional. `auto' (default) or `manual', as for
+%%   {@link start_listener/2}
 %% - `socket_opts' - Optional. gen_tcp/inet options for the client socket,
 %%   for example `[{ip, {192,168,1,10}}, {recbuf, 262144}]'. On h3 the
 %%   options that apply to UDP are used and TCP-only ones (`nodelay',
@@ -854,9 +879,10 @@ connect(Host, Port, Path, Opts) ->
     Handler :: module() | undefined.
 connect(Host, Port, Path, Opts, Handler) ->
     Transport = maps:get(transport, Opts, h3),
-    case Transport of
-        h2 -> connect_h2(Host, Port, Path, Opts, Handler);
-        h3 -> connect_h3(Host, Port, Path, Opts, Handler)
+    case {valid_flow_control(Opts), Transport} of
+        {false, _} -> {error, {invalid_option, flow_control}};
+        {true, h2} -> connect_h2(Host, Port, Path, Opts, Handler);
+        {true, h3} -> connect_h3(Host, Port, Path, Opts, Handler)
     end.
 
 %% ============================================================================
@@ -904,6 +930,27 @@ reset_stream(Session, Stream, ErrorCode) ->
 -spec stop_sending(session(), stream(), non_neg_integer()) -> ok | {error, term()}.
 stop_sending(Session, Stream, ErrorCode) ->
     webtransport_session:stop_sending(Session, Stream, ErrorCode).
+
+%% @doc Return receive credit for `Bytes' of the data received on `Stream'.
+%%
+%% Only on a session started with `flow_control => manual'; a no-op
+%% otherwise. Stream data is then credited to the peer as the application
+%% consumes it, not as the handler receives it: the peer stays one stream
+%% window ahead of what was consumed on each stream (QUIC stream credit on
+%% HTTP/3, `WT_MAX_STREAM_DATA' on HTTP/2), and one session window ahead
+%% across the session (`WT_MAX_DATA', where WebTransport flow control is
+%% in force).
+%%
+%% It never blocks: call it from the handler, from a worker the handler
+%% gave the data to, or from any process the session may be calling.
+%% Bytes beyond what was received and not yet consumed are ignored. A
+%% stream stays in the session until its data is consumed, unless its
+%% receive side was reset or stopped; the handler can also return the
+%% `{consume, Stream, Bytes}' action.
+-spec consume(session(), stream(), non_neg_integer()) -> ok.
+consume(Session, Stream, Bytes) when is_integer(Stream), Stream >= 0,
+                                     is_integer(Bytes), Bytes >= 0 ->
+    webtransport_session:consume(Session, Stream, Bytes).
 
 %% @doc Signal that no new streams will be created.
 -spec drain_session(session()) -> ok.
@@ -957,8 +1004,9 @@ early_data_accepted(Session) ->
 validate_listener_opts(Opts) ->
     Required = [transport, port, certfile, keyfile, handler],
     Missing = [K || K <- Required, not maps:is_key(K, Opts)],
-    case Missing of
-        [] -> ok;
+    case {Missing, valid_flow_control(Opts)} of
+        {[], true} -> ok;
+        {[], false} -> {error, {invalid_option, flow_control}};
         _ -> {error, {missing_options, Missing}}
     end.
 
@@ -1895,6 +1943,7 @@ client_session_opts(Request, Opts) ->
         max_streams_bidi => maps:get(max_streams_bidi, Opts, ?DEFAULT_MAX_STREAMS_BIDI),
         max_streams_uni => maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI),
         max_send_buffer => maps:get(max_send_buffer, Opts, ?DEFAULT_MAX_SEND_BUFFER),
+        flow_control => maps:get(flow_control, Opts, auto),
         declared_flow_control => client_declares_flow_control(Opts)
     }.
 

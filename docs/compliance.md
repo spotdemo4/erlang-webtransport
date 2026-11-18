@@ -47,7 +47,9 @@ Audited 2026-11-13 against quic 2.7.0 and h2 0.17.0.
   final size, credit returned with WT_MAX_DATA,
   WT_MAX_STREAM_DATA and WT_MAX_STREAMS, blocked capsules sent. On h3,
   QUIC stream credit is returned once the handler has taken the data
-  (§5.4), draft-02 included.
+  (§5.4), draft-02 included. With `flow_control => manual`, all receive
+  credit (QUIC stream, WT_MAX_STREAM_DATA, WT_MAX_DATA, WT_MAX_STREAMS)
+  follows what the application consumed instead.
 - **Stream state (h2).** Resets, STOP_SENDING, data and flow-control capsules
   on a stream in the wrong state are WT_STREAM_STATE_ERROR session errors;
   STOP_SENDING is answered with WT_RESET_STREAM.
@@ -73,6 +75,7 @@ Audited 2026-11-13 against quic 2.7.0 and h2 0.17.0.
 | Class | Path | Spec | Gap |
 |---|---|---|---|
 | upstream | h2 | http2-16 §3.4 | WT_ERROR, WT_STREAM_STATE_ERROR and WT_FLOW_CONTROL_ERROR have no HTTP/2 codepoints yet (0xTBD). Session errors use RST_STREAM with PROTOCOL_ERROR or FLOW_CONTROL_ERROR, after a WT_CLOSE_SESSION that carries 0 or the h3 WT_FLOW_CONTROL_ERROR value. Switch when IANA assigns them. |
+| upstream | h3 | http3-17 §5.4 | Our sender counts bytes against the peer's WT_MAX_DATA when it hands them to QUIC, not when QUIC sends them, since quic does not report per-stream send credit. The limit is never exceeded, but a stream the peer holds at its QUIC window keeps the session credit for the bytes queued behind it, which can stall our other streams. |
 
 ## Classes used by the audit
 

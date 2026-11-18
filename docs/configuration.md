@@ -19,6 +19,7 @@ webtransport:start_listener(Name, Opts).
 | `max_streams_bidi` | no | 100 | Bidirectional streams the peer may have open at once |
 | `max_streams_uni` | no | 100 | Unidirectional streams the peer may have open at once |
 | `max_send_buffer` | no | 4194304 (4 MB) | Bytes a session may hold waiting for the peer's flow-control credit; a send beyond it fails with `{error, send_buffer_full}` |
+| `flow_control` | no | `auto` | Who returns receive credit for stream data: `auto` once the handler callback returns, `manual` only for the bytes passed to `webtransport:consume/3` (see below) |
 | `ip` | no | wildcard | Bind address (`inet:ip_address()`; IPv4 4-tuple or IPv6 8-tuple) |
 | `family` | no | `inet` | `inet` or `inet6`; forces the family when no `ip` is given (e.g. the IPv6 wildcard) |
 | `socket_opts` | no | `[]` | Extra options for the underlying listener socket (h3 only) |
@@ -93,7 +94,7 @@ webtransport:connect(Host, Port, Path, Opts).
 | `socket_opts` | `[]` | gen_tcp/inet options for the client socket (see below) |
 | `protocols` | `[]` | Subprotocols to offer, in preference order |
 | `require_protocol` | `false` | Fail with `{error, {alpn_error, _}}` when the server picks none |
-| `max_data`, `max_stream_data`, `max_streams_bidi`, `max_streams_uni`, `max_send_buffer` | as for listeners | Limits we grant the server, and our send queue |
+| `max_data`, `max_stream_data`, `max_streams_bidi`, `max_streams_uni`, `max_send_buffer`, `flow_control` | as for listeners | Limits we grant the server, our send queue, and who returns receive credit |
 | `compat_mode` | `latest` | HTTP/3 draft selection (see below) |
 
 ### Client socket options
@@ -284,6 +285,16 @@ and [draft-16](https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http2-1
   draft, draft-02 included. Credit follows your handler: if it passes data
   to another process, return only once that process has taken it, and the
   peer stays one window ahead of it.
+- **Manual credit** -- with `flow_control => manual`, credit follows
+  `webtransport:consume(Session, Stream, Bytes)` (or the handler action
+  `{consume, Stream, Bytes}`) instead of the callback: QUIC stream credit on
+  HTTP/3, `WT_MAX_STREAM_DATA` on HTTP/2, and `WT_MAX_DATA` where
+  WebTransport flow control is in force. The handler can return at once and
+  each stream's peer stays one window past what was consumed on it.
+  `consume/3` is a cast and ignores bytes beyond what was delivered and not
+  yet consumed. A stream stays in the session, holding its stream credit,
+  until its data is consumed or its receive side is reset or stopped. On
+  HTTP/3 unconsumed bytes also hold back QUIC connection credit.
 
 ## Datagram Limits
 

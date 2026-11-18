@@ -107,7 +107,12 @@
     %% A peer stays one stream window ahead of a slow handler
     slow_handler_bounds_peer_test/1,
     slow_handler_bounds_draft02_peer_test/1,
-    busy_router_bounds_draft02_peer_test/1
+    busy_router_bounds_draft02_peer_test/1,
+
+    %% flow_control => manual: credit follows consume/3, per stream
+    manual_credit_test/1,
+    manual_credit_draft02_test/1,
+    invalid_flow_control_option_test/1
 ]).
 
 %% ============================================================================
@@ -173,7 +178,9 @@ groups() ->
         start_listener_invalid_keyfile_test,
         start_listener_bad_pem_test,
         sni_callback_round_trip_test,
-        slow_handler_bounds_peer_test
+        slow_handler_bounds_peer_test,
+        manual_credit_test,
+        invalid_flow_control_option_test
     ],
     %% Embedding via h3_settings/0 + accept/4 is HTTP/3-only.
     H3Only = [embedded_accept_round_trip_test, quic_stream_limit_credit_test,
@@ -193,7 +200,8 @@ groups() ->
         {h3_legacy_tests, [sequence], [legacy_draft02_round_trip_test,
                                        legacy_draft07_round_trip_test,
                                        slow_handler_bounds_draft02_peer_test,
-                                       busy_router_bounds_draft02_peer_test]}
+                                       busy_router_bounds_draft02_peer_test,
+                                       manual_credit_draft02_test]}
     ].
 
 init_per_suite(Config) ->
@@ -1993,6 +2001,142 @@ slow_handler_bound(Config, ConnectOpts, RouterLoad) ->
         flush_exits(),
         process_flag(trap_exit, false)
     end.
+
+%% ============================================================================
+%% Manual receive credit
+%% ============================================================================
+
+-define(MANUAL_TOTAL, 4 * 1024 * 1024).
+
+%% overview-14 §4.3, http3-17 §5.4, http2-16 §4.4: with
+%% `flow_control => manual', stream data is credited as the application
+%% consumes it, not as the handler receives it. The handler returns at
+%% once. On one session, a stream whose data is never consumed stops after
+%% one window while another stream, consumed as it arrives, carries all of
+%% its data; consuming the first stream's data lets it finish too.
+manual_credit_test(Config) ->
+    manual_credit(Config, #{}).
+
+%% draft-02 has no WebTransport flow control: per-stream QUIC credit,
+%% returned by consume/3, is the bound.
+manual_credit_draft02_test(Config) ->
+    manual_credit(Config, #{compat_mode => legacy_browser_compat}).
+
+manual_credit(Config, ConnectOpts) ->
+    process_flag(trap_exit, true),
+    Transport = proplists:get_value(transport, Config),
+    Port = test_helpers:find_free_port(),
+    Name = list_to_atom("manual_listener_" ++ integer_to_list(Port)),
+    %% On h3 the Erlang client counts bytes against WT_MAX_DATA as it hands
+    %% them to QUIC, held stream included, as it cannot see QUIC stream
+    %% credit. A session window above what both streams offer keeps that
+    %% from stalling the read stream; h2 runs with the default window.
+    SessionWindow = case Transport of
+        h3 -> #{max_data => 4 * ?MANUAL_TOTAL};
+        h2 -> #{}
+    end,
+    {ok, _} = webtransport:start_listener(Name, SessionWindow#{
+        transport => Transport,
+        port => Port,
+        certfile => proplists:get_value(certfile, Config),
+        keyfile => proplists:get_value(keyfile, Config),
+        handler => wt_manual_handler,
+        handler_opts => #{owner => self()},
+        flow_control => manual
+    }),
+    try
+        timer:sleep(100),
+        {ok, Session} = webtransport:connect("localhost", Port, <<"/test">>,
+                                             ConnectOpts#{transport => Transport,
+                                                          verify => verify_none}),
+        Server = receive {manual_session, S} -> S after 5000 -> error(no_server_session) end,
+        ?assertMatch({ok, #{flow_control := manual}}, webtransport:session_info(Server)),
+        {ok, Held} = webtransport:open_stream(Session, bidi),
+        {ok, Read} = webtransport:open_stream(Session, bidi),
+        Chunk = binary:copy(<<0>>, 65536),
+        N = ?MANUAL_TOTAL div 65536,
+        Senders = [spawn_link(fun() -> send_chunks(Session, Id, Chunk, N) end)
+                   || Id <- [Held, Read]],
+        %% The server's stream ids: the order data first arrives on them is
+        %% not known, so map them by what the client opened.
+        {HeldBytes, ReadBytes} = manual_read_until(Server, ?MANUAL_TOTAL, 0, 0, undefined,
+                                                   15000),
+        ct:pal("~p ~p: read stream got ~p bytes while the held one got ~p",
+               [Transport, ConnectOpts, ReadBytes, HeldBytes]),
+        ?assertEqual(?MANUAL_TOTAL, ReadBytes),
+        %% One stream window (256 KiB on h2, 512 KiB of QUIC stream credit
+        %% on h3), far from the 4 MiB offered.
+        ?assert(HeldBytes > 0),
+        ?assert(HeldBytes =< 1024 * 1024),
+        %% Nothing more arrives on the held stream until it is consumed.
+        timer:sleep(500),
+        ?assertEqual(0, drain_manual_data()),
+        HeldId = get(manual_held_id),
+        ok = webtransport:consume(Server, HeldId, HeldBytes),
+        Rest = manual_consume_all(Server, HeldId, ?MANUAL_TOTAL - HeldBytes, 15000),
+        ?assertEqual(?MANUAL_TOTAL, HeldBytes + Rest),
+        [begin unlink(P), exit(P, kill) end || P <- Senders],
+        try webtransport:close_session(Session) catch exit:_ -> ok end
+    after
+        webtransport:stop_listener(Name),
+        timer:sleep(100),
+        flush_exits(),
+        process_flag(trap_exit, false)
+    end.
+
+%% Consume every byte that arrives on one stream (the read one) and none on
+%% the other (the held one), until the read stream has `Total' bytes. The
+%% first stream data arrives on decides which is held, so that both
+%% streams are certain to have started.
+manual_read_until(_Server, Total, Held, Total, _HeldId, _Timeout) ->
+    {Held, Total};
+manual_read_until(Server, Total, Held, Read, HeldId, Timeout) ->
+    receive
+        {manual_data, Id, Bytes} when HeldId =:= undefined ->
+            put(manual_held_id, Id),
+            manual_read_until(Server, Total, Held + Bytes, Read, Id, Timeout);
+        {manual_data, HeldId, Bytes} ->
+            manual_read_until(Server, Total, Held + Bytes, Read, HeldId, Timeout);
+        {manual_data, Id, Bytes} ->
+            ok = webtransport:consume(Server, Id, Bytes),
+            manual_read_until(Server, Total, Held, Read + Bytes, HeldId, Timeout)
+    after Timeout ->
+        error({read_stream_stalled, Held, Read})
+    end.
+
+manual_consume_all(_Server, _Id, 0, _Timeout) ->
+    0;
+manual_consume_all(Server, Id, Left, Timeout) ->
+    receive
+        {manual_data, Id, Bytes} ->
+            ok = webtransport:consume(Server, Id, Bytes),
+            Bytes + manual_consume_all(Server, Id, Left - Bytes, Timeout)
+    after Timeout ->
+        error({held_stream_stalled, Left})
+    end.
+
+drain_manual_data() ->
+    receive {manual_data, _, Bytes} -> Bytes + drain_manual_data() after 0 -> 0 end.
+
+%% A flow_control value other than auto or manual is refused up front.
+invalid_flow_control_option_test(Config) ->
+    Transport = proplists:get_value(transport, Config),
+    ?assertEqual({error, {invalid_option, flow_control}},
+                 webtransport:start_listener(bad_flow_control, #{
+                     transport => Transport,
+                     port => test_helpers:find_free_port(),
+                     certfile => proplists:get_value(certfile, Config),
+                     keyfile => proplists:get_value(keyfile, Config),
+                     handler => wt_manual_handler,
+                     flow_control => true
+                 })),
+    ?assertEqual({error, {invalid_option, flow_control}},
+                 webtransport:connect("localhost", 1, <<"/test">>,
+                                      #{transport => Transport, flow_control => on})),
+    ?assertEqual({error, {invalid_option, flow_control}},
+                 webtransport:accept(self(), 0, [{<<":method">>, <<"CONNECT">>}],
+                                     #{transport => Transport, handler => wt_manual_handler,
+                                       flow_control => yes})).
 
 %% The router of a server session's connection: it monitors the session.
 server_router(Session) ->
