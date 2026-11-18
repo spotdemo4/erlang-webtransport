@@ -9,3 +9,7 @@ rebar3.crashdump
 cert.pem
 key.pem
 interop-chrome/venv/
+
+# gleam build (gleam.toml). manifest.toml is left out: rebar.lock is the lock.
+/build/
+/manifest.toml

@@ -9,7 +9,9 @@
 > application has processed the data, so a handler can pass stream data to
 > another process and return at once. See
 > [Manual receive credit](#manual-receive-credit). The change is on the
-> `manual-flow-control` branch, merged into `main`.
+> `manual-flow-control` branch, merged into `main`. `main` also has a
+> `gleam.toml`, so Gleam projects can depend on it from git:
+> `webtransport = { git = "https://github.com/spotdemo4/erlang-webtransport", ref = "<commit>" }`.
 
 An Erlang implementation of the [WebTransport](https://www.w3.org/TR/webtransport/) protocol over:
 

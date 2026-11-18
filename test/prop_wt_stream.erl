@@ -1,6 +1,11 @@
 %% @doc PropEr property-based tests for webtransport_stream module.
 -module(prop_wt_stream).
 
+%% PropEr is a rebar3 test dependency. A Gleam project that depends on this
+%% package from git compiles test/ as well, without PropEr; Gleam doesn't
+%% define TEST, which rebar3 eunit does.
+-ifdef(TEST).
+
 -include_lib("proper/include/proper.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
@@ -324,3 +329,5 @@ reset_clears_send_buffer_property_test() ->
     ?assertEqual(true, proper:quickcheck(prop_reset_clears_send_buffer(), [
         {numtests, 200}, {to_file, user}
     ])).
+
+-endif.
