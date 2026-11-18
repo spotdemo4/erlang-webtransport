@@ -276,6 +276,7 @@ handle_stream(Stream, bidi, Data, State) ->
 | `{close_stream, Stream}` | Half-close a stream (send FIN) |
 | `{reset_stream, Stream, ErrorCode}` | Abort a stream with an error code |
 | `{stop_sending, Stream, ErrorCode}` | Ask the peer to stop sending on a stream |
+| `{consume, Stream, Bytes}` | Return receive credit for bytes received on a stream (`flow_control => manual`) |
 | `drain_session` | Signal that no new streams will be opened |
 | `{close_session, ErrorCode, Reason}` | Close the session |
 
@@ -384,6 +385,7 @@ my_h2_handler(Conn, StreamId, <<"GET">>, Path, Headers) ->
 | `max_stream_data` | 262144 | Per-stream window (HTTP/2) |
 | `max_streams_bidi` | 100 | Max bidi streams |
 | `max_streams_uni` | 100 | Max uni streams |
+| `flow_control` | `auto` | `manual` to return receive credit with `consume/3`, see [Manual receive credit](#manual-receive-credit) |
 | `path` | from `:path` | Request path, for h2 servers whose handler gets it as an argument |
 
 `accept/4` validates the CONNECT headers and the client's SETTINGS,
@@ -452,6 +454,7 @@ ok = webtransport:send(Session, Stream, Data, fin).
 ok = webtransport:close_stream(Session, Stream).
 ok = webtransport:reset_stream(Session, Stream, ErrorCode).
 ok = webtransport:stop_sending(Session, Stream, ErrorCode).
+ok = webtransport:consume(Session, Stream, Bytes).  %% flow_control => manual
 
 %% Datagrams
 ok = webtransport:send_datagram(Session, Data).
@@ -467,7 +470,8 @@ ok = webtransport:close_session(Session, ErrorCode, Reason).
 %% Info :: #{transport, stream_count, local_max_data, remote_max_data,
 %%           local_max_streams_bidi, local_max_streams_uni,
 %%           remote_max_streams_bidi, remote_max_streams_uni,
-%%           bytes_sent, bytes_received, wt_draft, max_datagram_size,
+%%           bytes_sent, bytes_received, bytes_consumed, flow_control,
+%%           wt_draft, max_datagram_size,
 %%           protocol => binary(), close_info => {Code, Msg}}
 ```
 
@@ -546,7 +550,43 @@ The library enforces:
 - **HTTP/3 prohibition** -- `WT_MAX_STREAM_DATA` and `WT_STREAM_DATA_BLOCKED` capsules are session errors on HTTP/3 (per-stream flow control uses native QUIC).
 - **HTTP/2 WebTransport-Init** -- the `WebTransport-Init` header ([draft-16 section 4.3.2](https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http2-16#section-4.3.2)) carries initial per-stream data limits. When both SETTINGS and the header are present, the greater value is used. A header that does not parse is refused with 400.
 - **Large sends** -- `send/4` accepts a payload of any size and returns `ok` once it is queued. Bytes beyond the session window (both transports) or the stream window (HTTP/2) wait in order on the stream, FIN is held until they are out, and the queue drains as the peer raises its limits. `WT_DATA_BLOCKED` tells the peer we are waiting.
-- **Credit on receive** -- the library sends `WT_MAX_DATA` (both transports) and `WT_MAX_STREAM_DATA` (HTTP/2) once half of a window has been consumed, so a peer that honours our windows is never left waiting. Over HTTP/3 the QUIC stream credit goes back once `handle_stream/4` returns, on every draft, draft-02 included. Credit follows your handler: if it passes data to another process, return only once that process has taken it, and the peer stays one window ahead of it.
+- **Credit on receive** -- the library sends `WT_MAX_DATA` (both transports) and `WT_MAX_STREAM_DATA` (HTTP/2) once half of a window has been consumed, so a peer that honours our windows is never left waiting. Over HTTP/3 the QUIC stream credit goes back once `handle_stream/4` returns, on every draft, draft-02 included. Credit follows your handler: if it passes data to another process, return only once that process has taken it, and the peer stays one window ahead of it, or use manual credit.
+
+### Manual receive credit
+
+All of a session's streams share one handler process, so a handler that
+blocks until a worker takes a stream's data stalls every other stream of the
+session, and a worker that calls the session meanwhile (to send its reply)
+deadlocks. With `flow_control => manual` on the listener, `accept/4` or
+`connect`, the handler returns at once and the application returns the
+credit when it has processed the bytes:
+
+```erlang
+handle_stream(Stream, _Type, Data, #{workers := Workers} = State) ->
+    Worker = maps:get(Stream, Workers),
+    Worker ! {data, Stream, Data},
+    {ok, State}.
+
+%% in the worker, once it has processed Data
+ok = webtransport:consume(Session, Stream, byte_size(Data)).
+```
+
+- Each stream's peer stays one stream window past what was consumed on it:
+  QUIC stream credit on HTTP/3 (draft-02 included), `WT_MAX_STREAM_DATA` on
+  HTTP/2. Where WebTransport flow control is in force, `WT_MAX_DATA` follows
+  the bytes consumed across the session too.
+- `consume/3` is a cast: it never blocks, so it is safe from the handler,
+  from a worker, or from a process the session is calling. The handler can
+  also return `{consume, Stream, Bytes}`. Bytes beyond what was delivered
+  and not yet consumed are ignored, and it does nothing on an `auto`
+  session.
+- A stream stays in the session until its data is consumed, even after both
+  sides finished, and only then returns its `WT_MAX_STREAMS` credit. A
+  stream whose receive side was reset by the peer or stopped with
+  `stop_sending/3` gives its unconsumed credit back as it ends.
+- Consume what you received or reset the stream. On HTTP/3, bytes not
+  consumed also hold back QUIC connection credit, so data left unconsumed
+  on enough streams stops the whole connection.
 
 ## Datagram limits
 

@@ -26,6 +26,7 @@
 -export([send/4, send_datagram/2]).
 -export([open_stream/2, close_stream/2]).
 -export([reset_stream/3, stop_sending/3]).
+-export([consume/3]).
 -export([drain/1, close/3]).
 -export([get_info/1]).
 -export([early_data_accepted/1]).
@@ -58,6 +59,12 @@
     remote_max_streams_uni = 0 :: non_neg_integer(),
     bytes_sent = 0 :: non_neg_integer(),
     bytes_received = 0 :: non_neg_integer(),
+    %% Received bytes the application has finished with, plus bytes a reset
+    %% stream never delivered. Receive credit is granted from here.
+    bytes_consumed = 0 :: non_neg_integer(),
+    %% Who returns receive credit: `auto' once the handler callback that got
+    %% the data returns, `manual' only when the application calls consume/3.
+    credit = auto :: auto | manual,
     %% Size of the session receive window we advertise and replenish.
     session_window = 0 :: non_neg_integer(),
     %% WebTransport flow control in force (http3-17 §5.1). Always on for
@@ -158,6 +165,15 @@ reset_stream(Session, StreamId, ErrorCode) ->
 -spec stop_sending(session(), stream_ref(), non_neg_integer()) -> ok | {error, term()}.
 stop_sending(Session, StreamId, ErrorCode) ->
     gen_statem:call(Session, {stop_sending, StreamId, ErrorCode}).
+
+%% @doc Return receive credit for `Bytes' of the data delivered on a
+%% stream, on a session started with `flow_control => manual'. A cast: it
+%% never blocks, so it is safe from the handler and from any process the
+%% session may be waiting on. Bytes beyond what was delivered and not yet
+%% consumed are ignored. A no-op on an `auto' session.
+-spec consume(session(), stream_ref(), non_neg_integer()) -> ok.
+consume(Session, StreamId, Bytes) ->
+    gen_statem:cast(Session, {consume, StreamId, Bytes}).
 
 %% @doc Initiate a graceful drain: no new streams, existing ones finish.
 -spec drain(session()) -> ok.
@@ -334,6 +350,7 @@ init_limits(Transport, TransportState, Opts, Data) ->
     end,
     Data#data{
         flow_control = FlowControl,
+        credit = credit_mode(maps:get(flow_control, Opts, auto)),
         local_max_data = MaxData,
         session_window = MaxData,
         local_max_streams_bidi = MaxBidi,
@@ -346,6 +363,9 @@ init_limits(Transport, TransportState, Opts, Data) ->
         peer_stream_data = maps:get(peer_stream_data, Opts, #{}),
         webtransport_init = maps:get(webtransport_init, Opts, #{})
     }.
+
+credit_mode(manual) -> manual;
+credit_mode(auto) -> auto.
 
 %% h2: limits from the peer SETTINGS in effect when the session was
 %% accepted, replacing the ones read before (no stream exists yet).
@@ -464,6 +484,9 @@ open(cast, {capsule, {datagram, Data}}, StateData) ->
     open_apply_transition(Transition, StateData1);
 open(cast, {capsule, Capsule}, StateData) ->
     apply_capsule(Capsule, StateData);
+
+open(cast, {consume, StreamId, Bytes}, StateData) ->
+    {keep_state, do_consume(StreamId, Bytes, StateData)};
 
 open(cast, {stream_data, StreamId, Data, Fin}, StateData) ->
     {StateData1, Transition} = handle_incoming_stream_data(StreamId, Data, Fin, StateData),
@@ -874,6 +897,9 @@ draining({call, _From} = Call, {send_datagram, _} = Req, StateData) ->
     after_draining(open(Call, Req, StateData));
 draining({call, From}, _, StateData) ->
     {keep_state, StateData, [{reply, From, {error, session_draining}}]};
+
+draining(cast, {consume, StreamId, Bytes}, StateData) ->
+    maybe_stop_if_drained(do_consume(StreamId, Bytes, StateData), []);
 
 draining(cast, {stream_data, StreamId, Data, Fin}, StateData) ->
     {StateData1, Transition} = handle_incoming_stream_data(StreamId, Data, Fin, StateData),
@@ -1468,11 +1494,18 @@ handle_incoming_capsule({unknown, Type, _Payload}, StateData) ->
     StateData.
 
 %% Over HTTP/3, the QUIC credit for the bytes goes back once they are
-%% handled, so the peer stays one stream window ahead of the handler.
+%% handled, so the peer stays one stream window ahead of the handler. With
+%% manual credit, bytes the handler got wait for consume/3; bytes it never
+%% got (a reset stream, an unknown one) are credited now.
 handle_incoming_stream_data(StreamId, Data, Fin,
-                            #data{transport = h3, transport_state = H3State} = StateData) ->
-    Result = receive_incoming_stream_data(StreamId, Data, Fin, StateData),
-    ok = webtransport_h3:consume(H3State, StreamId, byte_size(Data)),
+                            #data{transport = h3, transport_state = H3State,
+                                  credit = Credit, bytes_received = Before} = StateData) ->
+    {StateData1, _} = Result = receive_incoming_stream_data(StreamId, Data, Fin, StateData),
+    Delivered = case Credit of
+        auto -> 0;
+        manual -> StateData1#data.bytes_received - Before
+    end,
+    ok = webtransport_h3:consume(H3State, StreamId, byte_size(Data) - Delivered),
     Result;
 handle_incoming_stream_data(StreamId, Data, Fin, StateData) ->
     receive_incoming_stream_data(StreamId, Data, Fin, StateData).
@@ -1522,10 +1555,11 @@ receive_stream_data(StreamId, Data, Fin,
                         true -> fun() -> Handler:handle_stream_fin(StreamId, Type, Data, HState) end;
                         false -> fun() -> Handler:handle_stream(StreamId, Type, Data, HState) end
                     end,
-                    StateData1 = StateData#data{bytes_received = SessRecv1},
+                    {Stream3a, StateData1} =
+                        auto_consume(Data, Stream2, StateData#data{bytes_received = SessRecv1}),
                     %% The handler runs before the next message is read, so
                     %% the peer cannot get more than one window ahead of it.
-                    {Stream3, StateData2} = grant_credit(StreamId, Stream2, StateData1),
+                    {Stream3, StateData2} = grant_credit(StreamId, Stream3a, StateData1),
                     {StateData3, Transition} =
                         apply_stream_callback(Callback(), StreamId, Stream3, Streams, StateData2),
                     {retire_stream(StreamId, StateData3), Transition};
@@ -1550,6 +1584,47 @@ receive_stream_data(StreamId, Data, Fin,
             {StateData, continue}
     end.
 
+%% With `auto' credit, bytes count as consumed once they reach the handler.
+%% With `manual' credit they wait for consume/3.
+auto_consume(Data, Stream, #data{credit = auto, bytes_consumed = C} = StateData) ->
+    {_, Stream1} = webtransport_stream:consume(Stream, byte_size(Data)),
+    {Stream1, StateData#data{bytes_consumed = C + byte_size(Data)}};
+auto_consume(_Data, Stream, #data{credit = manual} = StateData) ->
+    {Stream, StateData}.
+
+%% consume/3 on a `manual' session: credit the bytes on the stream and the
+%% session, then retire the stream if this was all that kept it. Only bytes
+%% the handler was given and has not consumed yet count, so the peer is
+%% never granted more than one window past the data delivered.
+do_consume(_StreamId, _Bytes, #data{credit = auto} = StateData) ->
+    StateData;
+do_consume(StreamId, Bytes, #data{streams = Streams} = StateData)
+  when is_integer(Bytes), Bytes > 0 ->
+    case maps:find(StreamId, Streams) of
+        {ok, Stream} ->
+            case webtransport_stream:consume(Stream, Bytes) of
+                {0, _} ->
+                    StateData;
+                {Taken, Stream1} ->
+                    StateData1 = StateData#data{
+                        bytes_consumed = StateData#data.bytes_consumed + Taken},
+                    transport_consume(StreamId, Taken, StateData1),
+                    {Stream2, StateData2} = grant_credit(StreamId, Stream1, StateData1),
+                    retire_stream(StreamId, StateData2#data{streams = Streams#{StreamId => Stream2}})
+            end;
+        error ->
+            StateData
+    end;
+do_consume(_StreamId, _Bytes, StateData) ->
+    StateData.
+
+%% h3: per-stream credit is the QUIC stream's, claimed with manual credit.
+%% h2: WT_MAX_STREAM_DATA, sent from grant_credit/3.
+transport_consume(StreamId, Bytes, #data{transport = h3, transport_state = H3State}) ->
+    webtransport_h3:consume(H3State, StreamId, Bytes);
+transport_consume(_StreamId, _Bytes, #data{transport = h2}) ->
+    ok.
+
 %% Account received bytes against the session limit and, on h2, the
 %% stream window.
 receive_into(_Stream, _Data, SessRecv, #data{flow_control = true, local_max_data = Max})
@@ -1569,19 +1644,21 @@ receive_data(Stream, Data, FlowControl) ->
 
 %% Receive-side credit (http3-17 §5.6, http2-16 §4.4): once half of a window
 %% has been consumed, advertise a new limit so the peer can keep sending.
-%% WT_MAX_DATA on both transports; WT_MAX_STREAM_DATA on h2 only.
+%% WT_MAX_DATA on both transports; WT_MAX_STREAM_DATA on h2 only. Both are
+%% counted from the bytes consumed, which with `auto' credit are the bytes
+%% delivered to the handler.
 -spec grant_credit(non_neg_integer(), webtransport_stream:stream(), #data{}) ->
     {webtransport_stream:stream(), #data{}}.
 grant_credit(_StreamId, Stream, #data{flow_control = false} = StateData) ->
     {Stream, StateData};
 grant_credit(StreamId, Stream,
-             #data{bytes_received = SessRecv, local_max_data = LocalMax,
+             #data{bytes_consumed = Consumed, local_max_data = LocalMax,
                    session_window = SessWindow} = StateData) ->
     Stream1 = grant_stream_credit(StreamId, Stream, StateData),
     StateData1 =
-        case SessRecv >= LocalMax - (SessWindow div 2) of
+        case Consumed >= LocalMax - (SessWindow div 2) of
             true ->
-                NewMax = SessRecv + SessWindow,
+                NewMax = Consumed + SessWindow,
                 send_flow_capsule({max_data, NewMax}, StateData),
                 StateData#data{local_max_data = NewMax};
             false ->
@@ -1592,11 +1669,11 @@ grant_credit(StreamId, Stream,
 grant_stream_credit(StreamId, Stream, #data{transport = h2,
                                             local_max_stream_data = StreamWindow} = StateData) ->
     Window = webtransport_stream:recv_window(Stream),
-    Received = webtransport_stream:bytes_received(Stream),
+    Consumed = webtransport_stream:bytes_consumed(Stream),
     case webtransport_stream:is_readable(Stream) andalso
-         Received >= Window - (StreamWindow div 2) of
+         Consumed >= Window - (StreamWindow div 2) of
         true ->
-            NewWindow = Received + StreamWindow,
+            NewWindow = Consumed + StreamWindow,
             send_flow_capsule({max_stream_data, StreamId, NewWindow}, StateData),
             webtransport_stream:update_recv_window(Stream, NewWindow);
         false ->
@@ -1713,7 +1790,9 @@ retire_stream(StreamId, #data{streams = Streams} = StateData) ->
         {ok, Stream} ->
             case stream_done(StreamId, Stream, StateData) of
                 true ->
-                    StateData1 = StateData#data{streams = maps:remove(StreamId, Streams)},
+                    StateData1 = release_unconsumed(
+                                   StreamId, Stream,
+                                   StateData#data{streams = maps:remove(StreamId, Streams)}),
                     case is_local_stream(StreamId, StateData) of
                         true -> StateData1;
                         false -> raise_peer_limit(webtransport_stream:type(Stream), StateData1)
@@ -1723,6 +1802,20 @@ retire_stream(StreamId, #data{streams = Streams} = StateData) ->
             end;
         error ->
             StateData
+    end.
+
+%% A stream whose receive side was aborted leaves with bytes the
+%% application never consumed (manual credit only). The peer cannot send
+%% them again, so their session credit goes back now.
+release_unconsumed(StreamId, Stream, #data{bytes_consumed = C} = StateData) ->
+    case webtransport_stream:unconsumed(Stream) of
+        0 ->
+            StateData;
+        Unconsumed ->
+            transport_consume(StreamId, Unconsumed, StateData),
+            {_, StateData1} = grant_credit(StreamId, Stream,
+                                           StateData#data{bytes_consumed = C + Unconsumed}),
+            StateData1
     end.
 
 raise_peer_limit(bidi, #data{local_max_streams_bidi = L} = StateData) ->
@@ -1764,7 +1857,8 @@ count_unreceived(StreamId, Stream, {reset, _Code, FinalSize},
         false -> webtransport_h3:stream_header_size(H3State, webtransport_stream:type(Stream))
     end,
     Missing = max(0, FinalSize - Header - webtransport_stream:bytes_received(Stream)),
-    StateData1 = StateData#data{bytes_received = SessRecv + Missing},
+    StateData1 = StateData#data{bytes_received = SessRecv + Missing,
+                                bytes_consumed = StateData#data.bytes_consumed + Missing},
     {_, StateData2} = grant_credit(StreamId, Stream, StateData1),
     StateData2;
 count_unreceived(_StreamId, _Stream, _Reason, StateData) ->
@@ -1856,6 +1950,8 @@ dispatch_action({reset_stream, Stream, Code} = Action, StateData) ->
     apply_do_result(do_reset_stream(Stream, Code, StateData), StateData, Action);
 dispatch_action({stop_sending, Stream, Code} = Action, StateData) ->
     apply_do_result(do_stop_sending(Stream, Code, StateData), StateData, Action);
+dispatch_action({consume, Stream, Bytes}, StateData) ->
+    {do_consume(Stream, Bytes, StateData), continue};
 dispatch_action(drain_session, StateData) ->
     do_drain(StateData),
     {StateData, drain};
@@ -1967,7 +2063,21 @@ maybe_stop_if_drained(#data{streams = Streams} = StateData, Actions, Next) ->
 
 %% A stream is done once every direction it has is finished: our send side
 %% on a uni stream we opened, the peer's on one it opened, both on bidi.
+%% With manual credit, a stream whose data the application has not all
+%% consumed is not done yet: it keeps its stream credit until then, unless
+%% its receive side was aborted.
 stream_done(StreamId, Stream, StateData) ->
+    directions_done(StreamId, Stream, StateData) andalso
+        not holds_credit(Stream, StateData).
+
+holds_credit(_Stream, #data{credit = auto}) ->
+    false;
+holds_credit(Stream, #data{credit = manual}) ->
+    webtransport_stream:unconsumed(Stream) > 0 andalso
+        webtransport_stream:remote_reset_code(Stream) =:= undefined andalso
+        webtransport_stream:local_stop_sending_code(Stream) =:= undefined.
+
+directions_done(StreamId, Stream, StateData) ->
     case webtransport_stream:type(Stream) of
         uni ->
             case is_local_stream(StreamId, StateData) of
@@ -2018,7 +2128,8 @@ build_info_base(#data{transport = Transport, streams = Streams,
                   local_max_data = LocalMaxData, remote_max_data = RemoteMaxData,
                   local_max_streams_bidi = LocalMaxBidi, local_max_streams_uni = LocalMaxUni,
                   remote_max_streams_bidi = RemoteMaxBidi, remote_max_streams_uni = RemoteMaxUni,
-                  bytes_sent = Sent, bytes_received = Received, close_info = Close}) ->
+                  bytes_sent = Sent, bytes_received = Received,
+                  bytes_consumed = Consumed, credit = Credit, close_info = Close}) ->
     Base = #{
         transport => Transport,
         stream_count => maps:size(Streams),
@@ -2029,7 +2140,9 @@ build_info_base(#data{transport = Transport, streams = Streams,
         remote_max_streams_bidi => RemoteMaxBidi,
         remote_max_streams_uni => RemoteMaxUni,
         bytes_sent => Sent,
-        bytes_received => Received
+        bytes_received => Received,
+        bytes_consumed => Consumed,
+        flow_control => Credit
     },
     case Close of
         undefined -> Base;
@@ -2285,6 +2398,101 @@ retire_stream_test() ->
     %% An open stream stays.
     Open = Data#data{streams = #{2 => webtransport_stream:new(2, uni, 0, 100)}},
     ?assert(maps:is_key(2, (retire_stream(2, Open))#data.streams)).
+
+%% An h2 connection that accepts every call and passes the flow-control
+%% capsules sent on the CONNECT stream to the test process.
+capsule_conn() ->
+    Parent = self(),
+    spawn(fun Loop() ->
+              receive
+                  {'$gen_call', From, {send_data, _, Bin, _}} ->
+                      {ok, Capsule, <<>>} = wt_h2_capsule:decode(Bin),
+                      Parent ! {capsule, Capsule},
+                      gen:reply(From, ok),
+                      Loop();
+                  {'$gen_call', From, _} ->
+                      gen:reply(From, ok),
+                      Loop()
+              end
+          end).
+
+sent_capsules() ->
+    receive {capsule, C} -> [C | sent_capsules()] after 50 -> [] end.
+
+%% A peer bidi stream 0 on an h2 server session: 40-byte stream windows,
+%% a 100-byte session window.
+manual_data(Credit, Conn) ->
+    (test_data())#data{transport_state = webtransport_h2:new(Conn, 1),
+                       handler = wt_slow_handler, handler_state = self(),
+                       credit = Credit, session_window = 100,
+                       local_max_stream_data = 40, peer_opened_bidi = 1,
+                       streams = #{0 => webtransport_stream:new(0, bidi, 100, 40)}}.
+
+%% http2-16 §4.4: with auto credit, WT_MAX_STREAM_DATA follows the bytes
+%% the handler received; with manual credit only consume/3 sends it, for at
+%% most the bytes received, and consume is a no-op on an auto session.
+manual_credit_h2_test() ->
+    Conn = capsule_conn(),
+    Bytes = binary:copy(<<1>>, 30),
+    {Auto, continue} = receive_stream_data(0, Bytes, false, manual_data(auto, Conn)),
+    ?assertEqual([{max_stream_data, 0, 70}], sent_capsules()),
+    ?assertEqual(30, Auto#data.bytes_consumed),
+    ?assertEqual(Auto, do_consume(0, 30, Auto)),
+
+    {Manual, continue} = receive_stream_data(0, Bytes, false, manual_data(manual, Conn)),
+    ?assertEqual([], sent_capsules()),
+    ?assertEqual({30, 0}, {Manual#data.bytes_received, Manual#data.bytes_consumed}),
+    %% Without consume, the peer is held to the first window.
+    ?assertMatch({_, {stop, _}},
+                 receive_stream_data(0, binary:copy(<<1>>, 11), false, Manual)),
+    ?assertMatch([{close_session, ?WT_FLOW_CONTROL_ERROR, _}], sent_capsules()),
+    %% Consuming more than was received credits only what was received.
+    Consumed = do_consume(0, 1000, Manual),
+    ?assertEqual([{max_stream_data, 0, 70}], sent_capsules()),
+    ?assertEqual(30, Consumed#data.bytes_consumed),
+    ?assertEqual(Consumed, do_consume(0, 1, Consumed)),
+    ?assertEqual(Consumed, do_consume(4, 10, Consumed)),
+    %% WT_MAX_DATA too follows what was consumed (http3-17 §5.6).
+    {More, continue} = receive_stream_data(0, binary:copy(<<1>>, 40), false, Consumed),
+    ?assertEqual([], sent_capsules()),
+    _ = do_consume(0, 40, More),
+    ?assertEqual([{max_stream_data, 0, 110}, {max_data, 170}], sent_capsules()),
+    exit(Conn, kill).
+
+%% With manual credit a finished stream keeps its stream credit until its
+%% data is consumed; one whose receive side was reset gives the session
+%% credit for its unconsumed bytes back as it leaves.
+manual_credit_retire_test() ->
+    Conn = capsule_conn(),
+    Data = (manual_data(manual, Conn))#data{
+             streams = #{2 => webtransport_stream:new(2, uni, 0, 100)}, peer_opened_uni = 1},
+    {Fin, continue} = receive_stream_data(2, binary:copy(<<1>>, 60), true, Data),
+    ?assert(maps:is_key(2, Fin#data.streams)),
+    ?assertEqual([], sent_capsules()),
+    Partly = do_consume(2, 20, Fin),
+    ?assert(maps:is_key(2, Partly#data.streams)),
+    Done = do_consume(2, 40, Partly),
+    ?assertNot(maps:is_key(2, Done#data.streams)),
+    ?assertEqual([{max_data, 160}, {max_streams_uni, 4}], sent_capsules()),
+
+    {Open, continue} = receive_stream_data(2, binary:copy(<<1>>, 60), false, Data),
+    Stream = maps:get(2, Open#data.streams),
+    {Reset, continue} = handle_remote_stream_closed(
+                          2, {reset, 7}, Open#data{streams = #{2 => Stream}}),
+    ?assertNot(maps:is_key(2, Reset#data.streams)),
+    ?assertEqual(60, Reset#data.bytes_consumed),
+    ?assertEqual([{max_data, 160}, {max_streams_uni, 4}], sent_capsules()),
+    exit(Conn, kill).
+
+%% The handler can return credit with the `{consume, Stream, Bytes}' action.
+consume_action_test() ->
+    Conn = capsule_conn(),
+    {Manual, continue} = receive_stream_data(0, binary:copy(<<1>>, 30), false,
+                                             manual_data(manual, Conn)),
+    {Consumed, continue} = handle_actions([{consume, 0, 30}], Manual),
+    ?assertEqual(30, Consumed#data.bytes_consumed),
+    ?assertEqual([{max_stream_data, 0, 70}], sent_capsules()),
+    exit(Conn, kill).
 
 %% h2: an id below the count already used and not in the map is finished.
 retired_by_ordinal_test_() ->

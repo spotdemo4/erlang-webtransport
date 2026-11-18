@@ -160,6 +160,7 @@
     {close_stream, webtransport:stream()} |
     {reset_stream, webtransport:stream(), non_neg_integer()} |
     {stop_sending, webtransport:stream(), non_neg_integer()} |
+    {consume, webtransport:stream(), non_neg_integer()} |
     drain_session |
     {close_session, non_neg_integer(), binary()}.
 

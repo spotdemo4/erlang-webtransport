@@ -24,15 +24,15 @@
 -export([id/1, type/1, state/1]).
 -export([is_open/1, is_writable/1, is_readable/1]).
 -export([send_window/1, recv_window/1]).
--export([bytes_sent/1, bytes_received/1]).
+-export([bytes_sent/1, bytes_received/1, bytes_consumed/1, unconsumed/1]).
 -export([send_buffer/1, send_queued/1]).
 
 %% State transitions
--export([send/2, receive_data/2, receive_fin/1]).
+-export([send/2, receive_data/2, receive_fin/1, consume/2]).
 -export([close_local/1, close_remote/1, close/1]).
 -export([reset/2, receive_reset/2, stop_sending/2, peer_stop_sending/2]).
 -export([reset_code/1, remote_reset_code/1, remote_fin/1, local_fin/1,
-         peer_stop_sending_code/1]).
+         peer_stop_sending_code/1, local_stop_sending_code/1]).
 -export([update_send_window/2, update_recv_window/2]).
 
 %% Buffer management
@@ -54,6 +54,9 @@
     recv_window :: non_neg_integer(),
     bytes_sent = 0 :: non_neg_integer(),
     bytes_received = 0 :: non_neg_integer(),
+    %% Received bytes the application has finished with. Receive credit is
+    %% granted from this offset, never from bytes_received.
+    bytes_consumed = 0 :: non_neg_integer(),
     %% Buffers
     %% Bytes waiting for flow-control credit, oldest first, and their
     %% total. A queue, so sending part of it copies only that part.
@@ -150,6 +153,9 @@ local_fin(#stream{local_fin = F}) -> F.
 -spec peer_stop_sending_code(stream()) -> undefined | non_neg_integer().
 peer_stop_sending_code(#stream{peer_stop_sending_code = C}) -> C.
 
+-spec local_stop_sending_code(stream()) -> undefined | non_neg_integer().
+local_stop_sending_code(#stream{local_stop_sending_code = C}) -> C.
+
 %% @doc Return the send flow-control window size.
 -spec send_window(stream()) -> non_neg_integer().
 send_window(#stream{send_window = W}) -> W.
@@ -165,6 +171,14 @@ bytes_sent(#stream{bytes_sent = B}) -> B.
 %% @doc Return the total bytes received on this stream so far.
 -spec bytes_received(stream()) -> non_neg_integer().
 bytes_received(#stream{bytes_received = B}) -> B.
+
+%% @doc Return the received bytes the application has consumed.
+-spec bytes_consumed(stream()) -> non_neg_integer().
+bytes_consumed(#stream{bytes_consumed = B}) -> B.
+
+%% @doc Return the received bytes the application has not consumed yet.
+-spec unconsumed(stream()) -> non_neg_integer().
+unconsumed(#stream{bytes_received = R, bytes_consumed = C}) -> R - C.
 
 %% @doc Return the pending send buffer contents.
 -spec send_buffer(stream()) -> binary().
@@ -219,6 +233,14 @@ receive_data(#stream{recv_window = Window, bytes_received = Received} = Stream, 
         false ->
             {ok, Stream#stream{bytes_received = NewReceived}}
     end.
+
+%% @doc Mark up to `Bytes' received bytes as consumed. Never goes past what
+%% was received, so the credit granted from it cannot run ahead of the
+%% data. Returns the bytes actually taken.
+-spec consume(stream(), non_neg_integer()) -> {non_neg_integer(), stream()}.
+consume(#stream{bytes_received = R, bytes_consumed = C} = Stream, Bytes) ->
+    Taken = min(Bytes, R - C),
+    {Taken, Stream#stream{bytes_consumed = C + Taken}}.
 
 %% @doc Record that the remote side sent FIN, transitioning the stream state.
 -spec receive_fin(stream()) -> {ok, stream()} | {error, term()}.
